@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import {
   allocateShotNumber,
@@ -7,15 +7,18 @@ import {
   NetworkError,
   ServiceUnavailableError,
 } from "./api";
-import { watchPendingStorage } from "./pendingSync";
+import {
+  clearPending,
+  loadInheritedPending,
+  loadOwnPending,
+  newOpId,
+  PENDING_KEY,
+  persistPending,
+  resolveTabId,
+  watchPendingStorage,
+} from "./pendingSync";
+import type { PendingOp } from "./pendingSync";
 import type { Allocation, ShotNumberItem } from "./types";
-
-interface PendingOp {
-  client_op_id: string;
-  scene_id: string;
-  notes: string;
-  inject: boolean;
-}
 
 type ErrorKind = "conflict" | "unavailable" | "network" | "unknown";
 interface ErrorState {
@@ -23,40 +26,14 @@ interface ErrorState {
   message: string;
 }
 
-const PENDING_KEY = "shotnumbers.pendingOp.v1";
-
-function newOpId(): string {
-  // crypto.randomUUID 仅在安全上下文可用（compose 内 http://web 并非安全上下文），需兜底
-  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
-  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16));
-  bytes[6] = (bytes[6] & 0x0f) | 0x40;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
-  const hex = [...bytes].map((b) => b.toString(16).padStart(2, "0"));
-  return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex
-    .slice(6, 8)
-    .join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10, 16).join("")}`;
-}
-
-function loadPending(): PendingOp | null {
-  try {
-    const raw = localStorage.getItem(PENDING_KEY);
-    return raw ? (JSON.parse(raw) as PendingOp) : null;
-  } catch {
-    return null;
-  }
-}
-
-function savePending(op: PendingOp | null) {
-  try {
-    if (op) localStorage.setItem(PENDING_KEY, JSON.stringify(op));
-    else localStorage.removeItem(PENDING_KEY);
-  } catch {
-    /* 存储不可用时仅保留内存态 */
-  }
-}
-
 export default function App() {
-  const restored = useRef<PendingOp | null>(loadPending());
+  // 标签页身份：本次挂载确定后不再变化（sessionStorage 保证刷新后仍是同一个）
+  const [tabId] = useState(resolveTabId);
+  // 恢复待重试操作：优先本页自己的槽位（刷新恢复），否则继承公告栏中其他页面
+  // 尚未恢复的操作。本页操作一旦持久化，就只认自己的槽位。
+  const restored = useRef<PendingOp | null>(
+    loadOwnPending(tabId) ?? loadInheritedPending(),
+  );
   const [sceneId, setSceneId] = useState(restored.current?.scene_id ?? "");
   const [notes, setNotes] = useState(restored.current?.notes ?? "");
   const [inject, setInject] = useState(restored.current?.inject ?? false);
@@ -65,6 +42,13 @@ export default function App() {
   const [error, setError] = useState<ErrorState | null>(null);
   const [result, setResult] = useState<Allocation | null>(null);
   const [issued, setIssued] = useState<ShotNumberItem[]>([]);
+  // 表单控件 id 按实例区分：同屏存在多个页面实例时 label 仍能正确关联
+  const uid = useId();
+  const sceneInputId = `scene-${uid}`;
+  const notesInputId = `notes-${uid}`;
+  const injectInputId = `inject-${uid}`;
+  // 本页放弃过的继承项：不再因公告栏变化而自动拾回
+  const ignoredInherited = useRef<Set<string>>(new Set());
 
   const refreshIssued = useCallback(async (scene: string) => {
     if (!scene) {
@@ -85,7 +69,10 @@ export default function App() {
 
   useEffect(
     () =>
+      // 公告栏变化只影响“继承展示”：本页已有自己的待重试操作时，
+      // 其他页面的写入/清除一概不得替换本页的操作身份
       watchPendingStorage(PENDING_KEY, (raw) => {
+        if (loadOwnPending(tabId)) return;
         let op: PendingOp | null = null;
         if (raw) {
           try {
@@ -93,6 +80,7 @@ export default function App() {
           } catch {
             return;
           }
+          if (ignoredInherited.current.has(op.client_op_id)) return;
         }
         setPending(op);
         setError(null);
@@ -102,7 +90,7 @@ export default function App() {
           setInject(op.inject);
         }
       }),
-    [],
+    [tabId],
   );
 
   async function attempt(op: PendingOp) {
@@ -117,7 +105,7 @@ export default function App() {
       });
       setResult(alloc);
       setPending(null);
-      savePending(null);
+      clearPending(tabId, op);
       void refreshIssued(op.scene_id);
     } catch (err) {
       // 失败一律保留待重试操作，由用户决定何时重试
@@ -159,7 +147,7 @@ export default function App() {
     // 有待重试操作时复用其 client_op_id —— 重试同一逻辑操作而非新建操作
     const op = buildOp(pending?.client_op_id ?? newOpId());
     setPending(op);
-    savePending(op);
+    persistPending(tabId, op);
     void attempt(op);
   }
 
@@ -167,13 +155,21 @@ export default function App() {
     if (submitting) return;
     const op = buildOp(newOpId());
     setPending(op);
-    savePending(op);
+    persistPending(tabId, op);
     void attempt(op);
   }
 
   function handleDiscardPending() {
+    const own = loadOwnPending(tabId);
+    if (own) {
+      // 本页自己的操作：清除自己的槽位（公告栏仍指向它时一并清除）
+      clearPending(tabId, own);
+    } else if (pending) {
+      // 仅是继承来的操作：只从本页移除，共享存储保持原样，
+      // 其他页面的待重试身份不受任何影响
+      ignoredInherited.current.add(pending.client_op_id);
+    }
     setPending(null);
-    savePending(null);
     setError(null);
   }
 
@@ -187,27 +183,27 @@ export default function App() {
       </p>
 
       <form onSubmit={handleSubmit} className="card">
-        <label htmlFor="scene">场次</label>
+        <label htmlFor={sceneInputId}>场次</label>
         <input
-          id="scene"
+          id={sceneInputId}
           value={sceneId}
           onChange={(e) => setSceneId(e.target.value)}
           placeholder="例如 S12-夜-仓库"
           required
         />
 
-        <label htmlFor="notes">备注</label>
+        <label htmlFor={notesInputId}>备注</label>
         <textarea
-          id="notes"
+          id={notesInputId}
           value={notes}
           onChange={(e) => setNotes(e.target.value)}
           placeholder="镜头内容备注（可空）"
           rows={2}
         />
 
-        <label className="inline" htmlFor="inject">
+        <label className="inline" htmlFor={injectInputId}>
           <input
-            id="inject"
+            id={injectInputId}
             type="checkbox"
             checked={inject}
             onChange={(e) => setInject(e.target.checked)}

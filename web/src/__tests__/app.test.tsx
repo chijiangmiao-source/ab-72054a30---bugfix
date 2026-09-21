@@ -11,7 +11,10 @@ function submit() {
   fireEvent.click(screen.getByRole("button", { name: /领取镜号|重试领取镜号/ }));
 }
 
-beforeEach(() => localStorage.clear());
+beforeEach(() => {
+  localStorage.clear();
+  sessionStorage.clear();
+});
 
 describe("镜号发放页（真实 API 联调）", () => {
   it("提交后展示镜号并出现在已发放列表", async () => {
