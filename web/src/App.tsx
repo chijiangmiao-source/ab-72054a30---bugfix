@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useState } from "react";
 import type { FormEvent } from "react";
 import {
   allocateShotNumber,
@@ -7,23 +7,15 @@ import {
   NetworkError,
   ServiceUnavailableError,
 } from "./api";
-import { watchPendingStorage } from "./pendingSync";
+import { createPendingStore } from "./pendingStore";
+import type { PendingOp, PendingStore } from "./pendingStore";
 import type { Allocation, ShotNumberItem } from "./types";
-
-interface PendingOp {
-  client_op_id: string;
-  scene_id: string;
-  notes: string;
-  inject: boolean;
-}
 
 type ErrorKind = "conflict" | "unavailable" | "network" | "unknown";
 interface ErrorState {
   kind: ErrorKind;
   message: string;
 }
-
-const PENDING_KEY = "shotnumbers.pendingOp.v1";
 
 function newOpId(): string {
   // crypto.randomUUID 仅在安全上下文可用（compose 内 http://web 并非安全上下文），需兜底
@@ -37,30 +29,17 @@ function newOpId(): string {
     .join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10, 16).join("")}`;
 }
 
-function loadPending(): PendingOp | null {
-  try {
-    const raw = localStorage.getItem(PENDING_KEY);
-    return raw ? (JSON.parse(raw) as PendingOp) : null;
-  } catch {
-    return null;
-  }
-}
-
-function savePending(op: PendingOp | null) {
-  try {
-    if (op) localStorage.setItem(PENDING_KEY, JSON.stringify(op));
-    else localStorage.removeItem(PENDING_KEY);
-  } catch {
-    /* 存储不可用时仅保留内存态 */
-  }
-}
-
-export default function App() {
-  const restored = useRef<PendingOp | null>(loadPending());
-  const [sceneId, setSceneId] = useState(restored.current?.scene_id ?? "");
-  const [notes, setNotes] = useState(restored.current?.notes ?? "");
-  const [inject, setInject] = useState(restored.current?.inject ?? false);
-  const [pending, setPending] = useState<PendingOp | null>(restored.current);
+export default function App({ store }: { store?: PendingStore }) {
+  // 每个页面只认自己正在处理的逻辑操作：优先恢复本页私有状态，
+  // 仅在全新页面（没有自己的操作）时继承一次其他页面广播的待重试操作。
+  const [pendingStore] = useState(() => store ?? createPendingStore());
+  const [initialOp] = useState(
+    () => pendingStore.loadOwn() ?? pendingStore.inheritBroadcast(),
+  );
+  const [sceneId, setSceneId] = useState(initialOp?.scene_id ?? "");
+  const [notes, setNotes] = useState(initialOp?.notes ?? "");
+  const [inject, setInject] = useState(initialOp?.inject ?? false);
+  const [pending, setPending] = useState<PendingOp | null>(initialOp);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<ErrorState | null>(null);
   const [result, setResult] = useState<Allocation | null>(null);
@@ -85,24 +64,18 @@ export default function App() {
 
   useEffect(
     () =>
-      watchPendingStorage(PENDING_KEY, (raw) => {
-        let op: PendingOp | null = null;
-        if (raw) {
-          try {
-            op = JSON.parse(raw) as PendingOp;
-          } catch {
-            return;
-          }
-        }
-        setPending(op);
+      pendingStore.watchBroadcast(() => {
+        // 其他页面保存/撤下了它们的操作。本页已有自己的操作时一律忽略——
+        // 广播绝不允许覆盖本页正在处理的操作；否则继承一次广播并转为己有。
+        const inherited = pendingStore.inheritBroadcast();
+        if (!inherited) return;
+        setPending(inherited);
         setError(null);
-        if (op) {
-          setSceneId(op.scene_id);
-          setNotes(op.notes);
-          setInject(op.inject);
-        }
+        setSceneId(inherited.scene_id);
+        setNotes(inherited.notes);
+        setInject(inherited.inject);
       }),
-    [],
+    [pendingStore],
   );
 
   async function attempt(op: PendingOp) {
@@ -117,7 +90,7 @@ export default function App() {
       });
       setResult(alloc);
       setPending(null);
-      savePending(null);
+      pendingStore.clearOwn(op);
       void refreshIssued(op.scene_id);
     } catch (err) {
       // 失败一律保留待重试操作，由用户决定何时重试
@@ -159,7 +132,7 @@ export default function App() {
     // 有待重试操作时复用其 client_op_id —— 重试同一逻辑操作而非新建操作
     const op = buildOp(pending?.client_op_id ?? newOpId());
     setPending(op);
-    savePending(op);
+    pendingStore.saveOwn(op);
     void attempt(op);
   }
 
@@ -167,17 +140,23 @@ export default function App() {
     if (submitting) return;
     const op = buildOp(newOpId());
     setPending(op);
-    savePending(op);
+    pendingStore.saveOwn(op);
     void attempt(op);
   }
 
   function handleDiscardPending() {
+    if (pending) pendingStore.clearOwn(pending);
     setPending(null);
-    savePending(null);
     setError(null);
   }
 
   const canSubmit = !submitting && sceneId.trim().length > 0;
+  // 同一文档可能挂载多个页面实例（多标签页联调测试），id 必须按实例唯一，
+  // 否则 label 的关联会串到别的实例上
+  const uid = useId();
+  const sceneInputId = `${uid}-scene`;
+  const notesInputId = `${uid}-notes`;
+  const injectInputId = `${uid}-inject`;
 
   return (
     <main className="page">
@@ -187,27 +166,27 @@ export default function App() {
       </p>
 
       <form onSubmit={handleSubmit} className="card">
-        <label htmlFor="scene">场次</label>
+        <label htmlFor={sceneInputId}>场次</label>
         <input
-          id="scene"
+          id={sceneInputId}
           value={sceneId}
           onChange={(e) => setSceneId(e.target.value)}
           placeholder="例如 S12-夜-仓库"
           required
         />
 
-        <label htmlFor="notes">备注</label>
+        <label htmlFor={notesInputId}>备注</label>
         <textarea
-          id="notes"
+          id={notesInputId}
           value={notes}
           onChange={(e) => setNotes(e.target.value)}
           placeholder="镜头内容备注（可空）"
           rows={2}
         />
 
-        <label className="inline" htmlFor="inject">
+        <label className="inline" htmlFor={injectInputId}>
           <input
-            id="inject"
+            id={injectInputId}
             type="checkbox"
             checked={inject}
             onChange={(e) => setInject(e.target.checked)}
